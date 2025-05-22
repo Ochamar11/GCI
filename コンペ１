@@ -1,1 +1,118 @@
+from google.colab import drive
+drive.mount('/content/drive', force_remount=True)
+
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestRegressor # 年齢の欠損値予測
+from sklearn.feature_selection import SelectKBest # どの特徴量が大事なのか
+from sklearn.ensemble import RandomForestClassifier # 予測モデル
+from sklearn.pipeline import make_pipeline # 処理を順番に
+
+# データセットの読み込み
+train_data = pd.read_csv('/content/drive/MyDrive/Colab Notebooks/train.csv')
+test_data = pd.read_csv('/content/drive/MyDrive/Colab Notebooks/test.csv')
+
+# train と test を縦にくっつける。Perished カラムを nan で足す
+test_data['Perished'] = np.nan
+df = pd.concat([train_data, test_data], ignore_index=True, sort=False) #授業でやったやつ
+
+# Age の欠損値も予測できんじゃね？
+age_df = df[['Age', 'Pclass','Sex','Parch','SibSp']] # age予測に使えそうなやつ
+age_df=pd.get_dummies(age_df) # Sex を数値にしたい
+known_age = age_df[age_df.Age.notnull()].values # Age がちゃんとあるやつ
+unknown_age = age_df[age_df.Age.isnull()].values # Age がないやつ
+X_age = known_age[:, 1:] # 特徴量　上で入れたPclassとか
+y_age = known_age[:, 0] # 予測したい Age
+rfr = RandomForestRegressor(random_state=0, n_estimators=100, n_jobs=-1) # モデル ランダムフォレスト、木が１００
+rfr.fit(X_age, y_age) # 学習
+predictedAges = rfr.predict(unknown_age[:, 1::])
+df.loc[(df.Age.isnull()), 'Age'] = predictedAges # 埋める　習ったやつ
+
+# 特徴量エンジニアリング
+
+# Name から Title を抽出。属性を知りたい
+df['Title'] = df['Name'].map(lambda x: x.split(', ')[1].split('. ')[0]) #カンマで分けて後ろ（Mr.tanakaみたいな)とった後にピリオドで分ける
+# 少ない Title はまとめた方がいいかも
+df['Title'].replace(['Capt', 'Col', 'Major', 'Dr', 'Rev', 'Don', 'Sir', 'the Countess', 'Lady', 'Dona', 'Mme', 'Ms', 'Mlle', 'Jonkheer'],
+                   ['Officer', 'Officer', 'Officer', 'Officer', 'Officer', 'Royalty', 'Royalty', 'Royalty', 'Royalty', 'Royalty', 'Mrs', 'Mrs', 'Miss', 'Master'], inplace=True)
+                                                                               #officerは船で働いてるひと、royaltyはすごそうなひと
+# 苗字も特徴量に使いたい
+df['Surname'] = df['Name'].map(lambda name: name.split(',')[0].strip()) #上のとだいたい一緒
+# 同じ苗字の人が何人いるか
+df['FamilyGroup'] = df['Surname'].map(df['Surname'].value_counts())
+
+# 女性や子供は助かりやすい？家族の人数も関係ありそう
+Female_Child_Group = df.loc[(df['FamilyGroup'] >= 2) & ((df['Age'] <= 16) | (df['Sex'] == 'female'))] #家族のだれか（夫とかお兄ちゃんとか）に助けてもらえる説
+Female_Child_Group = Female_Child_Group.groupby('Surname')['Perished'].mean()
+Male_Adult_Group = df.loc[(df['FamilyGroup'] >= 2) & (df['Age'] > 16) & (df['Sex'] == 'male')] #動けるから生存してる説
+Male_Adult_List = Male_Adult_Group.groupby('Surname')['Perished'].mean()
+
+Dead_list = set(Female_Child_Group[Female_Child_Group.apply(lambda x: x == 1)].index) # 死亡率高い苗字リスト
+Survived_list = set(Male_Adult_List[Male_Adult_List.apply(lambda x: x == 0)].index) # 生存率高い苗字リスト
+
+# Perishedが欠損している人（テストデータ）の属性（sex, age, title)を勝手に決めちゃう 個別で見ると変わっちゃうけど、多分全体で見ればプラス
+df.loc[(df['Perished'].isnull()) & (df['Surname'].apply(lambda x: x in Dead_list)),
+        ['Sex', 'Age', 'Title']] = ['male', 28.0, 'Mr'] # 死亡率が高い家族で生死がわからない人→若い男性ってことにする
+df.loc[(df['Perished'].isnull()) & (df['Surname'].apply(lambda x: x in Survived_list)),
+        ['Sex', 'Age', 'Title']] = ['female', 5.0, 'Mrs'] # 生存率が高い家族で生死がわからない人→小さい女の子ってことにする
+
+# Fare の欠損値は一番多そうなEmbarked と Pclass使って埋めたい
+fare = df.loc[(df['Embarked'] == 'S') & (df['Pclass'] == 3), 'Fare'].median()
+df['Fare'] = df['Fare'].fillna(fare)
+
+# 家族の人数で新しい特徴量　少人数なら生きそう　大人数なら死にそう
+df['Family'] = df['SibSp'] + df['Parch'] + 1
+df.loc[(df['Family'] >= 2) & (df['Family'] <= 4), 'Family_label'] = 2
+df.loc[((df['Family'] >= 5) & (df['Family'] <= 7)) | (df['Family'] == 1), 'Family_label'] = 1
+df.loc[(df['Family'] >= 8), 'Family_label'] = 0
+
+# チケットのグループも何か影響あるかも？（家族のときととやってることは一緒）
+Ticket_Count = dict(df['Ticket'].value_counts())
+df['TicketGroup'] = df['Ticket'].map(Ticket_Count)
+df.loc[(df['TicketGroup'] >= 2) & (df['TicketGroup'] <= 4), 'Ticket_label'] = 2
+df.loc[((df['TicketGroup'] >= 5) & (df['TicketGroup'] <= 8)) | (df['TicketGroup'] == 1), 'Ticket_label'] = 1
+df.loc[(df['TicketGroup'] >= 11), 'Ticket_label'] = 0
+
+# Cabin の欠損値はとりあえず Unknown で
+df['Cabin'] = df['Cabin'].fillna('Unknown')
+df['Cabin_label'] = df['Cabin'].str.get(0) # 最初の文字だけ
+
+# Embarked の欠損値は一番多いSで
+df['Embarked'] = df['Embarked'].fillna('S')
+
+# 前処理！使うカラムを選んで、カテゴリカル変数を数値に
+df = df[['Perished','Pclass','Sex','Age','Fare','Embarked','Title','Family_label','Cabin_label','Ticket_label']]
+df = pd.get_dummies(df) #get_dummiesはdataframeを与えれば自動で変えてくれる
+
+# 学習データとテストデータに分ける
+train = df[df['Perished'].notnull()]
+test = df[df['Perished'].isnull()].drop('Perished',axis=1) #perishedカラムを消して予測に使う特徴量だけのデータにしてる
+
+# numpy 配列に変換
+X = train.values[:,1:]
+y = train.values[:,0].astype(int)
+test_x = test.values
+
+# モデルを作る ランダムフォレストで
+select = SelectKBest(k = 20) # 特徴量選抜　20は何となく
+clf = RandomForestClassifier(random_state = 10,
+                            warm_start = True,
+                            n_estimators = 26, 木の数
+                            max_depth = 6, # 深さ
+                            max_features = 'sqrt')
+pipeline = make_pipeline(select, clf)
+pipeline.fit(X, y) # 学習
+
+# 予測して、提出ファイルを作る
+PassengerId=test_data['PassengerId']
+predictions = pipeline.predict(test_x)
+submission = pd.DataFrame({"PassengerId": PassengerId, "Perished": predictions.astype(np.int32)})
+submission.to_csv("my_submission_pelished_minimal.csv", index=False)
+
+from google.colab import files
+files.download("my_submission_pelished_minimal.csv")
+
+# --- 参考文献 ---
+print("\n--- 参考文献 ---")
+print("https://qiita.com/shiroino11111/items/21bf1303587eeae0fc30")
 
